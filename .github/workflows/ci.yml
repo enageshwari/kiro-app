@@ -1,0 +1,215 @@
+name: CI — Build, Push & Trigger E2E
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION:     us-east-1
+  ECR_REPOSITORY: kiro-app
+  IMAGE_TAG:      ${{ github.sha }}
+
+# Required for OIDC token request
+permissions:
+  id-token: write   # request JWT from GitHub OIDC provider
+  contents: read
+
+jobs:
+  # ── 1. Unit tests (runs on PRs and main) ──────────────────────────────────
+  unit-test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run unit tests
+        run: npm test
+
+  # ── 2. Build & push to ECR (main only) ────────────────────────────────────
+  build-and-push:
+    name: Build & Push to ECR
+    runs-on: ubuntu-latest
+    needs: unit-test
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      image_uri: ${{ steps.push.outputs.image_uri }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+          # No access key / secret key — OIDC exchanges a JWT for temp credentials
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag & push image
+        id: push
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE_URI="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+          docker build -t "$IMAGE_URI" .
+          docker push "$IMAGE_URI"
+          echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
+
+      - name: Update ECS service — attach ALB and set desired count to 1
+        env:
+          REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          IMAGE_URI="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
+
+          # Register new task def revision with the real image
+          TASK_DEF=$(aws ecs describe-task-definition \
+            --task-definition kiro-app \
+            --query 'taskDefinition' --output json)
+
+          NEW_TASK_DEF=$(echo "$TASK_DEF" | jq \
+            --arg IMAGE "$IMAGE_URI" \
+            '.containerDefinitions[0].image = $IMAGE |
+             del(.taskDefinitionArn, .revision, .status,
+                 .requiresAttributes, .compatibilities,
+                 .registeredAt, .registeredBy)')
+
+          NEW_TASK_ARN=$(aws ecs register-task-definition \
+            --cli-input-json "$NEW_TASK_DEF" \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+
+          echo "New task def: $NEW_TASK_ARN"
+
+          # Update service: desired count=1, attach ALB target group, force new deploy
+          aws ecs update-service \
+            --cluster kiro-cluster \
+            --service kiro-app \
+            --task-definition "$NEW_TASK_ARN" \
+            --desired-count 1 \
+            --load-balancers "targetGroupArn=${{ secrets.TARGET_GROUP_ARN }},containerName=kiro-app,containerPort=3000" \
+            --force-new-deployment
+
+          echo "ECS service updated."
+
+  # ── 3. Trigger E2E via API Gateway webhook ─────────────────────────────────
+  #
+  # Flow:
+  #   POST /run-e2e → API Gateway (returns 202 immediately)
+  #                 → Lambda triggered async → starts Fargate Playwright task
+  #                 → Lambda polls ECS → writes result to CloudWatch
+  #   GHA polls CloudWatch every 30s (max 15 min) until result appears
+  # ──────────────────────────────────────────────────────────────────────────
+  trigger-e2e:
+    name: Trigger E2E Tests & Wait for Result
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Configure AWS credentials via OIDC
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: POST to API Gateway webhook
+        run: |
+          PAYLOAD=$(jq -n \
+            --arg imageTag  "${{ env.IMAGE_TAG }}" \
+            --arg appUrl    "${{ secrets.APP_URL }}" \
+            --arg runId     "${{ github.run_id }}" \
+            --arg commitSha "${{ github.sha }}" \
+            '{imageTag: $imageTag, appUrl: $appUrl, runId: $runId, commitSha: $commitSha}')
+
+          echo "Triggering E2E pipeline..."
+
+          HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" \
+            -X POST "${{ secrets.E2E_TRIGGER_URL }}" \
+            -H "Content-Type: application/json" \
+            -H "x-api-key: ${{ secrets.E2E_API_KEY }}" \
+            --max-time 30 \
+            -d "$PAYLOAD")
+
+          echo "API Gateway response: $HTTP_CODE"
+
+          if [ "$HTTP_CODE" != "202" ]; then
+            echo "Failed to trigger E2E pipeline (expected 202, got $HTTP_CODE)"
+            exit 1
+          fi
+
+          echo "E2E pipeline triggered."
+
+      - name: Poll CloudWatch for E2E result
+        run: |
+          LOG_GROUP="/ecs/kiro-e2e"
+          STREAM_PREFIX="e2e-results/${{ github.run_id }}"
+          MAX_WAIT=900
+          POLL_INTERVAL=30
+          ELAPSED=0
+
+          echo "Polling CloudWatch for E2E result..."
+          echo "Log group : $LOG_GROUP"
+          echo "Stream    : $STREAM_PREFIX"
+
+          while [ $ELAPSED -lt $MAX_WAIT ]; do
+            sleep $POLL_INTERVAL
+            ELAPSED=$((ELAPSED + POLL_INTERVAL))
+
+            STREAMS=$(aws logs describe-log-streams \
+              --log-group-name "$LOG_GROUP" \
+              --log-stream-name-prefix "$STREAM_PREFIX" \
+              --query 'logStreams[*].logStreamName' \
+              --output text 2>/dev/null || echo "")
+
+            if [ -z "$STREAMS" ] || [ "$STREAMS" = "None" ]; then
+              echo "  [${ELAPSED}s] Waiting for result stream..."
+              continue
+            fi
+
+            EVENT=$(aws logs get-log-events \
+              --log-group-name "$LOG_GROUP" \
+              --log-stream-name "$STREAMS" \
+              --limit 1 \
+              --query 'events[0].message' \
+              --output text 2>/dev/null || echo "")
+
+            if [ -z "$EVENT" ] || [ "$EVENT" = "None" ]; then
+              echo "  [${ELAPSED}s] Stream exists, waiting for result event..."
+              continue
+            fi
+
+            echo "Result: $EVENT"
+
+            RESULT=$(echo "$EVENT"      | jq -r '.result')
+            TASK_ARN=$(echo "$EVENT"    | jq -r '.taskArn')
+            STOP_REASON=$(echo "$EVENT" | jq -r '.stopReason')
+
+            echo "E2E result  : $RESULT"
+            echo "Task ARN    : $TASK_ARN"
+            echo "Stop reason : $STOP_REASON"
+            echo "CW logs     : $LOG_GROUP"
+
+            if [ "$RESULT" = "PASSED" ]; then
+              echo "✅ E2E tests PASSED."
+              exit 0
+            else
+              echo "❌ E2E tests FAILED. Check CloudWatch: $LOG_GROUP"
+              exit 1
+            fi
+          done
+
+          echo "❌ Timed out after ${MAX_WAIT}s. Check CloudWatch: $LOG_GROUP"
+          exit 1
