@@ -58,14 +58,21 @@ jobs:
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Build, tag & push image
         id: push
         env:
           REGISTRY: ${{ steps.login-ecr.outputs.registry }}
         run: |
           IMAGE_URI="${REGISTRY}/${ECR_REPOSITORY}:${IMAGE_TAG}"
-          docker build -t "$IMAGE_URI" .
-          docker push "$IMAGE_URI"
+          docker buildx build \
+            --cache-from type=registry,ref="${REGISTRY}/${ECR_REPOSITORY}:cache" \
+            --cache-to   type=registry,ref="${REGISTRY}/${ECR_REPOSITORY}:cache",mode=max \
+            --tag "$IMAGE_URI" \
+            --push \
+            .
           echo "image_uri=${IMAGE_URI}" >> "$GITHUB_OUTPUT"
 
       - name: Update ECS service — attach ALB and set desired count to 1
@@ -102,7 +109,15 @@ jobs:
             --load-balancers "targetGroupArn=${{ secrets.TARGET_GROUP_ARN }},containerName=kiro-app,containerPort=3000" \
             --force-new-deployment
 
-          echo "ECS service updated."
+          echo "ECS service updated — waiting for deployment to stabilize..."
+
+          # Wait for the service to reach steady state before triggering E2E.
+          # This ensures E2E tests run against the newly deployed version, not the old one.
+          aws ecs wait services-stable \
+            --cluster kiro-cluster \
+            --services kiro-app
+
+          echo "ECS deployment stable. App is running."
 
   # ── 3. Trigger E2E via API Gateway webhook ─────────────────────────────────
   #
@@ -124,6 +139,24 @@ jobs:
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
           aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Smoke check — verify app is reachable before triggering E2E
+        run: |
+          APP_URL="${{ secrets.APP_URL }}"
+          echo "Checking app health at ${APP_URL}/health..."
+          for i in 1 2 3 4 5; do
+            HTTP=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "${APP_URL}/health")
+            echo "  Attempt $i: HTTP $HTTP"
+            if [ "$HTTP" = "200" ]; then
+              echo "App is healthy."
+              break
+            fi
+            if [ $i -eq 5 ]; then
+              echo "❌ App health check failed after 5 attempts. Aborting E2E."
+              exit 1
+            fi
+            sleep 10
+          done
 
       - name: POST to API Gateway webhook
         run: |
