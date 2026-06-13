@@ -31,15 +31,22 @@ push to main
   │         runs on every push and PR
   │
   ├─ Job 2: Build & Push to ECR          [main only]
-  │         docker build → push kiro-app:<sha> to ECR
-  │         aws ecs update-service --desired-count 1  (first deploy wires ALB)
-  │         aws ecs update-service --force-new-deployment (subsequent deploys)
+  │         docker buildx build (ECR registry cache for faster rebuilds)
+  │         push kiro-app:<sha> to ECR
+  │         aws ecs update-service --desired-count 1 (wires ALB on first deploy)
+  │         aws ecs wait services-stable  ← waits for new task to be healthy
+  │         ensures E2E always runs against the newly deployed version
   │
   └─ Job 3: Trigger E2E & Wait           [main only]
+            health check smoke test (5 retries) before triggering
             POST /run-e2e → API Gateway (202)
             GHA polls CloudWatch /ecs/kiro-e2e every 30s (max 15 min)
             Pass/fail gates the workflow
 ```
+
+**Why `ecs wait services-stable` matters:** without it, GHA triggers E2E immediately after
+`update-service`. The new container may not be running yet, so tests hit the old version
+or a 502/504. The wait ensures the new image is serving traffic before E2E fires.
 
 ## GitHub Actions secrets
 
