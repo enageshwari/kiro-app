@@ -1,14 +1,15 @@
 # kiro-app
 
-Express.js web application with unit tests.
+Express.js web application with unit tests and a fully automated CI/CD pipeline
+that triggers Playwright E2E tests on AWS Fargate on every push to `main`.
 
-## Repos in this system
+## Repositories in this system
 
-| Repo | Purpose |
-|---|---|
-| **kiro-app** (this repo) | App source, unit tests, Dockerfile, CI pipeline |
-| **kiro-e2e** | Playwright E2E tests and runner Dockerfile |
-| **kiro-infra** | AWS CDK infrastructure (private — contains account-specific config) |
+| Repo | Visibility | Purpose |
+|---|---|---|
+| [kiro-app](https://github.com/enageshwari/kiro-app) | Public | App source, unit tests, Dockerfile, CI pipeline |
+| [kiro-e2e](https://github.com/enageshwari/kiro-e2e) | Public | Playwright E2E tests and Fargate runner Dockerfile |
+| [kiro-infra](https://github.com/enageshwari/kiro-infra) | Public | AWS CDK infrastructure |
 
 ## Local development
 
@@ -19,42 +20,49 @@ npm test           # run unit tests (vitest)
 npm run build      # compile TypeScript → dist/
 ```
 
-## CI/CD pipeline (GitHub Actions)
+## CI/CD pipeline
 
 Every push to `main` runs three jobs in sequence:
 
 ```
-1. unit-test       → runs vitest
-2. build-and-push  → builds Docker image, pushes to ECR, updates ECS service
-3. trigger-e2e     → calls API Gateway webhook → Lambda → Fargate runs Playwright tests
-                     polls CloudWatch for pass/fail result (up to 15 min)
+push to main
+  │
+  ├─ Job 1: Unit Tests (vitest)
+  │         runs on every push and PR
+  │
+  ├─ Job 2: Build & Push to ECR          [main only]
+  │         docker build → push kiro-app:<sha> to ECR
+  │         aws ecs update-service --desired-count 1  (first deploy wires ALB)
+  │         aws ecs update-service --force-new-deployment (subsequent deploys)
+  │
+  └─ Job 3: Trigger E2E & Wait           [main only]
+            POST /run-e2e → API Gateway (202)
+            GHA polls CloudWatch /ecs/kiro-e2e every 30s (max 15 min)
+            Pass/fail gates the workflow
 ```
 
-PRs only run `unit-test`. The push and E2E jobs are `main`-only.
+## GitHub Actions secrets
 
-## GitHub Actions secrets required
+Set in: Settings → Secrets and variables → Actions
 
-Set these in: Settings → Secrets and variables → Actions
+| Secret | Description | Where to get it |
+|---|---|---|
+| `AWS_ROLE_ARN` | IAM OIDC role for GHA | `KiroGitHubOidcStack` CDK output |
+| `APP_URL` | ALB public URL | `KiroAppStack` CDK output |
+| `TARGET_GROUP_ARN` | ALB target group ARN | `KiroAppStack` CDK output |
+| `E2E_TRIGGER_URL` | API Gateway webhook URL | `KiroE2EPipelineStack` CDK output |
+| `E2E_API_KEY` | API Gateway API key value | `aws apigateway get-api-keys --include-values` |
 
-| Secret | Description |
-|---|---|
-| `AWS_ROLE_ARN` | IAM role ARN for OIDC authentication (from kiro-infra deploy output) |
-| `APP_URL` | Public ALB URL of the deployed app (from kiro-infra deploy output) |
-| `TARGET_GROUP_ARN` | ALB target group ARN (from kiro-infra deploy output) |
-| `E2E_TRIGGER_URL` | API Gateway webhook URL (from kiro-infra deploy output) |
-| `E2E_API_KEY` | API Gateway API key value (retrieve after infra deploy — see kiro-infra README) |
-
-> **No AWS access keys are stored.** Authentication uses OIDC — GHA exchanges
-> a short-lived JWT for temporary AWS credentials scoped to this repo only.
+> No AWS access keys stored — uses OIDC. See [kiro-infra](https://github.com/enageshwari/kiro-infra) for details.
 
 ## Docker image
 
-Built automatically by GHA on every push to `main`.
-Base image: `node:20-alpine` (multi-stage build, ~50MB final image).
-Published to ECR: `<account>.dkr.ecr.us-east-1.amazonaws.com/kiro-app:<commit-sha>`
+Built by GHA on every push to `main`.
+Published to: `<account>.dkr.ecr.us-east-1.amazonaws.com/kiro-app:<commit-sha>`
 
-To build locally:
 ```bash
+# Build and run locally
 docker build -t kiro-app:local .
 docker run -p 3000:3000 kiro-app:local
+# visit http://localhost:3000
 ```
